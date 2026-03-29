@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Disc Hockey</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #0a0a1a;
+      overflow: hidden;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #overlay {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(8px);
+      z-index: 10;
+    }
+    #overlay h1 {
+      font-family: -apple-system, sans-serif;
+      font-size: clamp(32px, 8vw, 64px);
+      font-weight: 900;
+      letter-spacing: 2px;
+      color: #fff;
+      text-shadow: 0 0 30px rgba(100,200,255,0.8);
+      margin-bottom: 12px;
+    }
+    #overlay p {
+      font-family: -apple-system, sans-serif;
+      font-size: clamp(14px, 3vw, 20px);
+      color: rgba(255,255,255,0.7);
+      margin-bottom: 40px;
+      text-align: center;
+      padding: 0 20px;
+    }
+    .btn {
+      font-family: -apple-system, sans-serif;
+      font-size: clamp(16px, 4vw, 24px);
+      font-weight: 700;
+      padding: 16px 48px;
+      border-radius: 50px;
+      border: none;
+      cursor: pointer;
+      margin: 8px;
+      transition: transform 0.1s, opacity 0.1s;
+    }
+    .btn:active { transform: scale(0.95); opacity: 0.85; }
+    .btn-primary {
+      background: linear-gradient(135deg, #00c6ff, #0072ff);
+      color: #fff;
+      box-shadow: 0 0 30px rgba(0,114,255,0.5);
+    }
+    .btn-secondary {
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      border: 2px solid rgba(255,255,255,0.3);
+    }
+    #goalFlash {
+      position: fixed; inset: 0;
+      pointer-events: none;
+      z-index: 5;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="goalFlash"></div>
+<div id="overlay">
+  <h1>DISC HOCKEY</h1>
+  <p>Flick your disc to hit the puck.<br>Score by shooting into the opponent's goal.</p>
+  <button class="btn btn-primary" id="btn1p">1 Player vs AI</button>
+  <button class="btn btn-secondary" id="btn2p">2 Players Local</button>
+</div>
+
+<script>
+'use strict';
+
+// ─── Canvas setup ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const FRICTION      = 0.985;
+const WALL_RESTITUTION = 0.65;
+const DISC_RESTITUTION = 0.82;
+const MAX_SPEED     = 28;
+const GOAL_FRAC     = 0.28;   // goal width as fraction of board width
+const BOARD_PAD     = 0;      // board fills screen edge-to-edge
+
+// Colors
+const COLOR_ICE        = '#e8f4ff';
+const COLOR_BLUE       = '#1e90ff';
+const COLOR_RED        = '#ff3b55';
+const COLOR_PUCK       = '#eeeeee';
+const COLOR_BLUE_GLOW  = 'rgba(30,144,255,0.7)';
+const COLOR_RED_GLOW   = 'rgba(255,59,85,0.7)';
+const COLOR_PUCK_GLOW  = 'rgba(220,220,255,0.6)';
+
+// ─── Game state ──────────────────────────────────────────────────────────────
+let mode  = null; // '1p' | '2p'
+let score = [0, 0];
+let celebration = null; // { player: 0|1, t: frames }
+let gameActive = false;
+
+// ─── Board geometry ──────────────────────────────────────────────────────────
+function board() {
+  const W = canvas.width, H = canvas.height;
+  const goalW = W * GOAL_FRAC;
+  return {
+    left:  BOARD_PAD,
+    right: W - BOARD_PAD,
+    top:   BOARD_PAD,
+    bottom:H - BOARD_PAD,
+    width: W - BOARD_PAD * 2,
+    height:H - BOARD_PAD * 2,
+    cx:    W / 2,
+    cy:    H / 2,
+    goalW,
+    goalLeft:  W / 2 - goalW / 2,
+    goalRight: W / 2 + goalW / 2,
+    wallThick: 6,
+  };
+}
+
+// ─── Disc class ──────────────────────────────────────────────────────────────
+class Disc {
+  constructor(x, y, r, color, glowColor, team) {
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    this.r = r;
+    this.color = color;
+    this.glowColor = glowColor;
+    this.team = team; // 0 = blue (bottom), 1 = red (top), -1 = puck
+    this.grabbed = false;
+    this.prevX = x; this.prevY = y;
+  }
+
+  speed() { return Math.sqrt(this.vx * this.vx + this.vy * this.vy); }
+
+  capSpeed() {
+    const s = this.speed();
+    if (s > MAX_SPEED) {
+      this.vx = this.vx / s * MAX_SPEED;
+      this.vy = this.vy / s * MAX_SPEED;
+    }
+  }
+
+  update(b) {
+    if (this.grabbed) { this.vx = 0; this.vy = 0; return; }
+
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vx *= FRICTION;
+    this.vy *= FRICTION;
+    if (Math.abs(this.vx) < 0.02) this.vx = 0;
+    if (Math.abs(this.vy) < 0.02) this.vy = 0;
+
+    // Wall bounce — only bounce off solid wall segments (not goal openings)
+    this.bounceWalls(b);
+  }
+
+  bounceWalls(b) {
+    const { left, right, top, bottom, goalLeft, goalRight, wallThick } = b;
+    const r = this.r;
+
+    // Side walls (full height)
+    if (this.x - r < left) {
+      this.x = left + r;
+      this.vx = Math.abs(this.vx) * WALL_RESTITUTION;
+    }
+    if (this.x + r > right) {
+      this.x = right - r;
+      this.vx = -Math.abs(this.vx) * WALL_RESTITUTION;
+    }
+
+    // Top wall — solid except goal opening
+    if (this.y - r < top) {
+      const inGoal = this.x > goalLeft && this.x < goalRight;
+      if (!inGoal) {
+        this.y = top + r;
+        this.vy = Math.abs(this.vy) * WALL_RESTITUTION;
+      }
+    }
+    // Bottom wall — solid except goal opening
+    if (this.y + r > bottom) {
+      const inGoal = this.x > goalLeft && this.x < goalRight;
+      if (!inGoal) {
+        this.y = bottom - r;
+        this.vy = -Math.abs(this.vy) * WALL_RESTITUTION;
+      }
+    }
+  }
+
+  draw() {
+    ctx.save();
+    // Outer glow
+    ctx.shadowBlur  = 24;
+    ctx.shadowColor = this.glowColor;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+    const grad = ctx.createRadialGradient(
+      this.x - this.r * 0.3, this.y - this.r * 0.3, this.r * 0.05,
+      this.x, this.y, this.r
+    );
+    grad.addColorStop(0, lighten(this.color, 0.45));
+    grad.addColorStop(1, this.color);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Rim
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Specular highlight
+    ctx.beginPath();
+    ctx.arc(this.x - this.r * 0.28, this.y - this.r * 0.28, this.r * 0.22, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function lighten(hex, amt) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  const r = Math.min(255, (n >> 16) + Math.round(255 * amt));
+  const g = Math.min(255, ((n >> 8) & 0xff) + Math.round(255 * amt));
+  const b = Math.min(255, (n & 0xff) + Math.round(255 * amt));
+  return `rgb(${r},${g},${b})`;
+}
+
+// ─── Elastic collision ────────────────────────────────────────────────────────
+function resolveCollision(a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const minDist = a.r + b.r;
+  if (dist >= minDist || dist === 0) return;
+
+  // Separate discs
+  const overlap = (minDist - dist) / 2;
+  const nx = dx / dist, ny = dy / dist;
+  if (!a.grabbed) { a.x -= nx * overlap; a.y -= ny * overlap; }
+  if (!b.grabbed) { b.x += nx * overlap; b.y += ny * overlap; }
+
+  // Relative velocity along normal
+  const dvx = b.vx - a.vx;
+  const dvy = b.vy - a.vy;
+  const dvn = dvx * nx + dvy * ny;
+  if (dvn > 0) return; // already separating
+
+  const ma = a.r * a.r; // mass ∝ area
+  const mb = b.r * b.r;
+  const imp = (-(1 + DISC_RESTITUTION) * dvn) / (1 / ma + 1 / mb);
+
+  if (!a.grabbed) {
+    a.vx -= (imp / ma) * nx;
+    a.vy -= (imp / ma) * ny;
+  }
+  if (!b.grabbed) {
+    b.vx += (imp / mb) * nx;
+    b.vy += (imp / mb) * ny;
+  }
+
+  a.capSpeed(); b.capSpeed();
+}
+
+// ─── Disc & puck instances ────────────────────────────────────────────────────
+let discs = [], puck = null;
+let blueDisc = null, redDisc = null;
+
+function createDiscs() {
+  const b = board();
+  const discR  = Math.min(b.width, b.height) * 0.062;
+  const puckR  = discR * 0.72;
+
+  blueDisc = new Disc(b.cx, b.bottom - discR * 3.5, discR, COLOR_BLUE, COLOR_BLUE_GLOW, 0);
+  redDisc  = new Disc(b.cx, b.top  + discR * 3.5, discR, COLOR_RED,  COLOR_RED_GLOW,  1);
+  puck     = new Disc(b.cx, b.cy,                puckR, COLOR_PUCK, COLOR_PUCK_GLOW, -1);
+
+  discs = [blueDisc, redDisc, puck];
+}
+
+// ─── Touch / flick handling ───────────────────────────────────────────────────
+// activeTouches: Map<touchId, { disc, history: [{x,y,t}] }>
+const activeTouches = new Map();
+
+function getTouchPos(touch) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (touch.clientX - rect.left) * (canvas.width  / rect.width),
+    y: (touch.clientY - rect.top)  * (canvas.height / rect.height),
+  };
+}
+
+function discAt(x, y, team) {
+  // Return the disc that belongs to `team` and is close to the touch point
+  // In 1p mode: team=0 only. In 2p mode: team is determined by y half.
+  for (const d of discs) {
+    if (d.team < 0) continue; // puck not directly grabbed
+    const b = board();
+    const allowedTeam = mode === '2p'
+      ? (y < b.cy ? 1 : 0)   // top half = red (team1), bottom half = blue (team0)
+      : 0;                     // 1p: only blue
+    if (d.team !== allowedTeam) continue;
+    const dx = d.x - x, dy = d.y - y;
+    if (dx * dx + dy * dy < (d.r * 2.2) * (d.r * 2.2)) return d;
+  }
+  return null;
+}
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (!gameActive) return;
+  for (const touch of e.changedTouches) {
+    const { x, y } = getTouchPos(touch);
+    const d = discAt(x, y, null);
+    if (d && !activeTouches.has(touch.identifier)) {
+      d.grabbed = true;
+      d.vx = 0; d.vy = 0;
+      activeTouches.set(touch.identifier, { disc: d, history: [{ x, y, t: performance.now() }] });
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!gameActive) return;
+  for (const touch of e.changedTouches) {
+    const state = activeTouches.get(touch.identifier);
+    if (!state) continue;
+    const { x, y } = getTouchPos(touch);
+    state.disc.x = x;
+    state.disc.y = y;
+    const now = performance.now();
+    state.history.push({ x, y, t: now });
+    // Keep only last 80ms
+    while (state.history.length > 1 && now - state.history[0].t > 80) {
+      state.history.shift();
+    }
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const touch of e.changedTouches) {
+    const state = activeTouches.get(touch.identifier);
+    if (!state) continue;
+    const { disc, history } = state;
+    disc.grabbed = false;
+
+    // Compute release velocity from touch history
+    if (history.length >= 2) {
+      const first = history[0];
+      const last  = history[history.length - 1];
+      const dt    = (last.t - first.t) / 1000; // seconds
+      if (dt > 0) {
+        const spd = Math.sqrt((last.x-first.x)**2 + (last.y-first.y)**2) / dt;
+        const cappedSpd = Math.min(spd * 0.012, MAX_SPEED);
+        const angle = Math.atan2(last.y - first.y, last.x - first.x);
+        disc.vx = Math.cos(angle) * cappedSpd;
+        disc.vy = Math.sin(angle) * cappedSpd;
+      }
+    }
+    activeTouches.delete(touch.identifier);
+  }
+}, { passive: false });
+
+// Mouse support (for testing on desktop)
+let mouseState = null;
+canvas.addEventListener('mousedown', e => {
+  if (!gameActive) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width  / rect.width);
+  const y = (e.clientY - rect.top)  * (canvas.height / rect.height);
+  const d = discAt(x, y, 0) || (mode === '2p' ? discAt(x, y, 1) : null);
+  if (d) {
+    d.grabbed = true; d.vx = 0; d.vy = 0;
+    mouseState = { disc: d, history: [{ x, y, t: performance.now() }] };
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  if (!mouseState || !gameActive) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width  / rect.width);
+  const y = (e.clientY - rect.top)  * (canvas.height / rect.height);
+  mouseState.disc.x = x;
+  mouseState.disc.y = y;
+  const now = performance.now();
+  mouseState.history.push({ x, y, t: now });
+  while (mouseState.history.length > 1 && now - mouseState.history[0].t > 80) {
+    mouseState.history.shift();
+  }
+});
+canvas.addEventListener('mouseup', () => {
+  if (!mouseState) return;
+  const { disc, history } = mouseState;
+  disc.grabbed = false;
+  if (history.length >= 2) {
+    const first = history[0], last = history[history.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    if (dt > 0) {
+      const spd = Math.sqrt((last.x-first.x)**2 + (last.y-first.y)**2) / dt;
+      const cappedSpd = Math.min(spd * 0.012, MAX_SPEED);
+      const angle = Math.atan2(last.y - first.y, last.x - first.x);
+      disc.vx = Math.cos(angle) * cappedSpd;
+      disc.vy = Math.sin(angle) * cappedSpd;
+    }
+  }
+  mouseState = null;
+});
+
+// ─── AI (1-player mode) ───────────────────────────────────────────────────────
+let aiCooldown = 0;
+
+function updateAI() {
+  if (mode !== '1p' || !gameActive) return;
+  const b = board();
+  const ai = redDisc;
+  if (ai.grabbed) return;
+
+  aiCooldown--;
+  if (aiCooldown > 0) return;
+
+  const puckSpeed = puck.speed();
+
+  // Decide: attack or defend
+  const defending = puck.y > b.cy;           // puck in AI's half? no → defend
+  const targetX   = defending
+    ? lerp(ai.x, b.cx, 0.04)                // return to center
+    : puck.x;
+  const targetY   = defending
+    ? b.top + ai.r * 3
+    : puck.y - ai.r * 2.5;
+
+  const dx = targetX - ai.x;
+  const dy = targetY - ai.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  if (dist < 4) return;
+
+  // Skill level: limit AI speed slightly
+  const spd = Math.min(dist * 0.07, MAX_SPEED * 0.55);
+  ai.vx = (dx / dist) * spd + ai.vx * 0.4;
+  ai.vy = (dy / dist) * spd + ai.vy * 0.4;
+  ai.capSpeed();
+
+  aiCooldown = 3;
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ─── Goal detection ───────────────────────────────────────────────────────────
+function checkGoal() {
+  if (!puck || !gameActive) return;
+  const b = board();
+  const inGoalX = puck.x > b.goalLeft && puck.x < b.goalRight;
+
+  if (puck.y + puck.r < b.top && inGoalX) {
+    // Puck went into top goal → blue (player 0) scores
+    triggerGoal(0);
+  } else if (puck.y - puck.r > b.bottom && inGoalX) {
+    // Puck went into bottom goal → red (player 1) scores
+    triggerGoal(1);
+  }
+}
+
+function triggerGoal(scoringTeam) {
+  score[scoringTeam]++;
+  celebration = { team: scoringTeam, t: 150 };
+  gameActive = false;
+
+  const flash = document.getElementById('goalFlash');
+  flash.style.background = scoringTeam === 0
+    ? 'rgba(30,144,255,0.35)'
+    : 'rgba(255,59,85,0.35)';
+  flash.style.opacity = '1';
+  setTimeout(() => { flash.style.opacity = '0'; }, 400);
+
+  setTimeout(() => {
+    resetPositions();
+    gameActive = true;
+    celebration = null;
+  }, 1800);
+}
+
+function resetPositions() {
+  const b = board();
+  const discR = blueDisc.r;
+  blueDisc.x = b.cx; blueDisc.y = b.bottom - discR * 3.5;
+  blueDisc.vx = 0;   blueDisc.vy = 0;
+  redDisc.x  = b.cx; redDisc.y  = b.top  + discR * 3.5;
+  redDisc.vx = 0;    redDisc.vy = 0;
+  puck.x = b.cx;     puck.y = b.cy;
+  puck.vx = 0;       puck.vy = 0;
+}
+
+// ─── Drawing ──────────────────────────────────────────────────────────────────
+function drawBoard() {
+  const b = board();
+  const W = canvas.width, H = canvas.height;
+
+  // Ice surface gradient
+  const iceGrad = ctx.createRadialGradient(b.cx, b.cy, 0, b.cx, b.cy, Math.max(W, H) * 0.7);
+  iceGrad.addColorStop(0, '#d0e8ff');
+  iceGrad.addColorStop(1, '#b0cce8');
+  ctx.fillStyle = iceGrad;
+  ctx.fillRect(b.left, b.top, b.width, b.height);
+
+  // Center line
+  ctx.save();
+  ctx.setLineDash([20, 14]);
+  ctx.strokeStyle = 'rgba(100,150,220,0.45)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(b.left, b.cy);
+  ctx.lineTo(b.right, b.cy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Center circle
+  ctx.save();
+  ctx.strokeStyle = 'rgba(100,150,220,0.35)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(b.cx, b.cy, b.width * 0.12, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  // Goal zones (colored rectangles behind goal lines)
+  const goalDepth = b.height * 0.04;
+
+  // Top goal zone (blue scores here)
+  const topGrad = ctx.createLinearGradient(0, b.top, 0, b.top + goalDepth);
+  topGrad.addColorStop(0, 'rgba(30,144,255,0.45)');
+  topGrad.addColorStop(1, 'rgba(30,144,255,0)');
+  ctx.fillStyle = topGrad;
+  ctx.fillRect(b.goalLeft, b.top, b.goalW, goalDepth);
+
+  // Bottom goal zone (red scores here)
+  const botGrad = ctx.createLinearGradient(0, b.bottom, 0, b.bottom - goalDepth);
+  botGrad.addColorStop(0, 'rgba(255,59,85,0.45)');
+  botGrad.addColorStop(1, 'rgba(255,59,85,0)');
+  ctx.fillStyle = botGrad;
+  ctx.fillRect(b.goalLeft, b.bottom - goalDepth, b.goalW, goalDepth);
+
+  // Draw walls
+  const wt = b.wallThick;
+  ctx.fillStyle = '#2a4a7f';
+
+  // Top wall — left segment
+  ctx.fillRect(b.left, b.top, b.goalLeft - b.left, wt);
+  // Top wall — right segment
+  ctx.fillRect(b.goalRight, b.top, b.right - b.goalRight, wt);
+  // Bottom wall — left segment
+  ctx.fillRect(b.left, b.bottom - wt, b.goalLeft - b.left, wt);
+  // Bottom wall — right segment
+  ctx.fillRect(b.goalRight, b.bottom - wt, b.right - b.goalRight, wt);
+  // Left wall
+  ctx.fillRect(b.left, b.top, wt, b.height);
+  // Right wall
+  ctx.fillRect(b.right - wt, b.top, wt, b.height);
+
+  // Goal posts (dots at goal corners)
+  const posts = [
+    [b.goalLeft,  b.top],
+    [b.goalRight, b.top],
+    [b.goalLeft,  b.bottom],
+    [b.goalRight, b.bottom],
+  ];
+  for (const [px, py] of posts) {
+    ctx.save();
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = '#ff0';
+    ctx.beginPath();
+    ctx.arc(px, py, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffdd00';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawScore() {
+  const b = board();
+  const fontSize = Math.min(b.width, b.height) * 0.07;
+  ctx.save();
+  ctx.font = `900 ${fontSize}px -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Blue score (bottom player)
+  ctx.fillStyle = COLOR_BLUE;
+  ctx.shadowBlur = 16;
+  ctx.shadowColor = COLOR_BLUE_GLOW;
+  ctx.fillText(score[0], b.cx, b.cy + b.height * 0.12);
+
+  // Red score (top player)
+  ctx.fillStyle = COLOR_RED;
+  ctx.shadowColor = COLOR_RED_GLOW;
+  ctx.fillText(score[1], b.cx, b.cy - b.height * 0.12);
+
+  ctx.restore();
+}
+
+function drawLabels() {
+  const b = board();
+  const fontSize = Math.min(b.width, b.height) * 0.025;
+  ctx.save();
+  ctx.font = `700 ${fontSize}px -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+
+  const p2Label = mode === '1p' ? 'AI' : 'PLAYER 2';
+  ctx.fillText(p2Label,   b.cx, b.top + b.height * 0.07);
+  ctx.fillText('PLAYER 1', b.cx, b.bottom - b.height * 0.07);
+  ctx.restore();
+}
+
+function drawCelebration() {
+  if (!celebration) return;
+  const b = board();
+  const alpha = Math.min(1, celebration.t / 30);
+  ctx.save();
+  ctx.font = `900 ${b.height * 0.12}px -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  if (celebration.team === 0) {
+    ctx.fillStyle = `rgba(30,144,255,${alpha})`;
+    ctx.shadowColor = COLOR_BLUE_GLOW;
+  } else {
+    ctx.fillStyle = `rgba(255,59,85,${alpha})`;
+    ctx.shadowColor = COLOR_RED_GLOW;
+  }
+  ctx.shadowBlur = 40;
+  ctx.fillText('GOAL!', b.cx, b.cy);
+  ctx.restore();
+  celebration.t--;
+}
+
+// ─── Game loop ────────────────────────────────────────────────────────────────
+function update() {
+  if (!gameActive && !celebration) return;
+
+  const b = board();
+  updateAI();
+
+  for (const d of discs) d.update(b);
+
+  // Resolve all disc-disc collisions (multiple passes for stability)
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < discs.length; i++) {
+      for (let j = i + 1; j < discs.length; j++) {
+        resolveCollision(discs[i], discs[j]);
+      }
+    }
+  }
+
+  checkGoal();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawBoard();
+  drawScore();
+  drawLabels();
+  for (const d of discs) d.draw();
+  drawCelebration();
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ─── Start game ───────────────────────────────────────────────────────────────
+function startGame(m) {
+  mode = m;
+  score = [0, 0];
+  createDiscs();
+  gameActive = true;
+  celebration = null;
+  document.getElementById('overlay').style.display = 'none';
+}
+
+document.getElementById('btn1p').addEventListener('click', () => startGame('1p'));
+document.getElementById('btn2p').addEventListener('click', () => startGame('2p'));
+
+// Prevent default browser gestures on the canvas
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+loop();
+</script>
+</body>
+</html>
